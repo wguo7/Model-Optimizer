@@ -1850,7 +1850,9 @@ def resolve_distribution_plan(
     spec to a copy of the config first, in the collective "model spec" step: its plan, and what
     makes the checkpoint's own code importable, with no ``prepare`` run
     (:func:`~modelopt.torch.utils.moe.apply_distributed_support` with ``prepare=False``). For
-    several models it is what supplies the expert-parallel plan. An expert-parallel plan then has
+    several models it is what supplies the expert-parallel plan. An EP degree of 1 still builds the
+    model, so the step then runs what makes the checkpoint's own code build, and nothing else of the
+    spec (:attr:`~modelopt.torch.models.EPSpec.make_buildable`). An expert-parallel plan then has
     every rank prepare a copy of the config as read, in the collective "model spec prepared" step,
     and returns that copy. Any other plan returns the config as read, with no ``prepare`` run
     (:attr:`~modelopt.torch.models.EPSpec.prepare`). A plan that
@@ -1896,25 +1898,32 @@ def resolve_distribution_plan(
     # every rank, or refuses, without the spec, whose prepare could fail, or patch the process,
     # for a load that never shards.
     stated = [hf_config]
-    if dist.broadcast_from(
+    # "build" for an EP degree of 1, whose decision still builds the checkpoint's own code.
+    step = dist.broadcast_from(
         "spec",
         lambda: (
             world_size > 1
             and auto_class in (None, AutoModelForCausalLM)
-            and _ep_degree(ep_size, hf_config.model_type) != 1
+            and ("plan" if _ep_degree(ep_size, hf_config.model_type) != 1 else "build")
         ),
-    ):
+    )
+    if step:
         # Before deciding: deciding without the spec would read an expert-parallel MoE as dense. Its
         # plan only: its prepare, which may patch the process, runs for an expert-parallel plan
         # alone. A rank that cannot apply it fails every rank, as a checkpoint read does above.
         def spec_stated() -> bool:
-            stated[0] = apply_distributed_support(
-                hf_config.model_type,
-                copy.deepcopy(hf_config),
-                ckpt_path=ckpt_path,
-                trust_remote_code=trust_remote_code,
-                prepare=False,
-            )
+            if step == "plan":
+                stated[0] = apply_distributed_support(
+                    hf_config.model_type,
+                    copy.deepcopy(hf_config),
+                    ckpt_path=ckpt_path,
+                    trust_remote_code=trust_remote_code,
+                    prepare=False,
+                )
+            elif (ep := _ep_spec(hf_config.model_type)) and ep.make_buildable is not None:
+                ep.make_buildable(
+                    hf_config, ckpt_path=ckpt_path, trust_remote_code=trust_remote_code
+                )
             return True
 
         dist.all_reduce("model spec", spec_stated, all)
